@@ -1,0 +1,58 @@
+# dataset configs
+dataset_cfg:
+  dataset_type: powerUAV
+  data_root_dir: /workspace/data/KITTI_Tracking/ #/dataset/KITTI_Tracking/
+  num_points: 4096 * 11  # Number of input points
+  num_classes: 19  # Number of valid classes
+  sub_grid_size: 0.06  # preprocess_parameter
+  
+
+# model configs
+model_cfg:
+  model_type: RandLANet
+  num_classes: 19  # Number of valid classes
+  k_n: 16  # KNN
+  num_layers: 4  # Number of layers
+  sub_sampling_ratio: [4, 4, 4, 4]  # sampling ratio of random sampling at each layer
+  d_out: [16, 64, 128, 256]  # feature dimension
+  num_sub_points: [(4096 * 11) // 4, (4096 * 11) // 16, (4096 * 11) // 64, (4096 * 11) // 256]
+
+# task configs
+task_type: SegTask
+missing_threshold: 0.2
+
+# optimizer & scheduler configs
+optimizer_cfg:
+  optimizer_type: Adam
+  lr: 0.01
+  weight_decay: 0
+  betas: [0.5, 0.999]
+  eps: 1.0e-6
+
+scheduler_cfg:
+  scheduler_type: StepLR
+  step_size: 20
+  gamma: 0.1
+
+# loss configs
+loss_cfg:
+  mask_weight: 0.2
+  rfn_obj_weight: 1.0
+  crs_obj_weight: 1.0 # 0.2
+  bbox_weight: 1.0
+  center_weight: 10.0
+  bc_weight: 1.0
+
+# train & eval configs
+train_cfg:
+  max_epochs: 100
+  train_steps: 500  # Number of steps per epochs
+  batch_size: 6
+  num_workers: 4
+  save_per_epoch: 40
+  save_top_k: 5
+  val_per_epoch: 1
+
+eval_cfg:
+  batch_size: 1
+  num_workers: 4
