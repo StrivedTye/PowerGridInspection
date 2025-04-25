@@ -19,9 +19,8 @@ class BaseDataset(ABC):
     def num_samples(self):
         raise NotImplementedError
 
-
     @abstractmethod
-    def get_sample(self, tracklet_id, frame_id):
+    def get_sample(self, sample_id):
         raise NotImplementedError
 
 
@@ -33,7 +32,23 @@ class EvalDatasetWrapper(torch.utils.data.Dataset):
         self.log = log
 
     def __len__(self):
-        pass
+        return self.dataset.num_samples()
 
     def __getitem__(self, idx):
-        pass
+        # read '*.las' file
+        # pc = self.read_las(path[idx])
+        pcd, label = self.dataset.get_sample(idx)
+
+        # after getting sample, we need to do the following processes, as the range of 'pc' is very large and noisy.
+
+        # step 1: preprocess: de-noise; down-sample
+
+        # step 2: divide it into blocks
+
+
+        # note that KPConv, DGCNN and RandLANet may have different inputs.
+        # for DGCNN and RandLANet
+        data = dict(pcds=pcd.astype('float32'),  # (n, 3)
+                    labels=label.astype('int'),  # (n,)
+                    )
+        return data

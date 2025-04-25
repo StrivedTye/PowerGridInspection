@@ -10,11 +10,11 @@ Here we list the most important part of our dependencies
 | ----------------- | -------------------------- |
 | open3d            | 0.15.2                     |
 | python            | 3.8.0                      |
-| pytorch           | 1.8.0(cuda11.1,cudnn8.0.5) |
+| pytorch           | 1.13.1(cuda11.7,cudnn8) |
 | pytorch-lightning | 1.5.10                     |
-| pytorch3d         | 0.6.2                      |
-| shapely           | 1.8.1                      |
-| torchvision       | 0.9.0                      |
+| pytorch3d         | 0.7.5                      |
+| shapely           | 2.0.0                      |
+| laspy             | 2.5.4                     |
 
 
 ## Dataset

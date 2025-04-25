@@ -1,10 +1,4 @@
-import torch.nn.functional as F
 import torch
-import time
-import json
-import os.path as osp
-
-from datasets.utils.pcd_utils import *
 from .base_task import BaseTask
 
 class SegTask(BaseTask):
@@ -16,12 +10,12 @@ class SegTask(BaseTask):
         logits = end_points['logits']
         labels = end_points['labels']
 
-        logits = logits.transpose(1, 2).reshape(-1, cfg.num_classes)
+        logits = logits.transpose(1, 2).reshape(-1, cfg.model_cfg.num_classes)
         labels = labels.reshape(-1)
 
         # Boolean mask of points that should be ignored
-        ignored_bool = labels == 0
-        for ign_label in cfg.ignored_label_inds:
+        ignored_bool = (labels == 0)
+        for ign_label in cfg.model_cfg.ignored_labels:
             ignored_bool = ignored_bool | (labels == ign_label)
 
         # Collect logits and labels that are not ignored
@@ -30,24 +24,19 @@ class SegTask(BaseTask):
         valid_labels_init = labels[valid_idx]
 
         # Reduce label values in the range of logit shape
-        reducing_list = torch.range(0, cfg.num_classes).long().cuda()
+        reducing_list = torch.arange(0, cfg.model_cfg.num_classes).long().cuda()
         inserted_value = torch.zeros((1,)).long().cuda()
-        for ign_label in cfg.ignored_label_inds:
+        for ign_label in cfg.model_cfg.ignored_labels:
             reducing_list = torch.cat([reducing_list[:ign_label], inserted_value, reducing_list[ign_label:]], 0)
         valid_labels = torch.gather(reducing_list, 0, valid_labels_init)
-        loss = self.get_loss(valid_logits, valid_labels, cfg.class_weights)
+        loss = self.get_loss(valid_logits, valid_labels)
         end_points['valid_logits'], end_points['valid_labels'] = valid_logits, valid_labels
         end_points['loss'] = loss
         return loss, end_points
 
-    def get_loss(self, logits, labels, pre_cal_weights):
-        # calculate the weighted cross entropy according to the inverse frequency
-        class_weights = torch.from_numpy(pre_cal_weights).float().cuda()
-        # one_hot_labels = F.one_hot(labels, self.config.num_classes)
-
-        criterion = torch.nn.CrossEntropyLoss(weight=class_weights, reduction='none')
+    def get_loss(self, logits, labels):
+        criterion = torch.nn.CrossEntropyLoss(reduction='mean')
         output_loss = criterion(logits, labels)
-        output_loss = output_loss.mean()
         return output_loss
 
     def training_step(self, batch, batch_idx):
@@ -55,14 +44,16 @@ class SegTask(BaseTask):
         # Forward pass
         end_points = self.model(batch)
 
-        loss, _ = self.compute_loss(end_points, self.cfg)
+        if self.cfg.model_cfg.model_type == "KPConv":
+            loss = self.model.loss(end_points['logits'], end_points['labels'])
+        else:
+            loss, _ = self.compute_loss(end_points, self.cfg)
 
         self.logger.experiment.add_scalars(
             'loss',
             {
                 'loss_total': loss,
-                'loss_bbox': loss,
-                'loss_center': loss,
+                'loss_ce': loss,
             },
             global_step=self.global_step
         )

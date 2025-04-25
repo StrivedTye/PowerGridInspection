@@ -34,6 +34,19 @@ def intersection_and_union_gpu(output, target, k, ignore_index=-1):
     return area_intersection, area_union, area_target
 
 
+def accuracy(output, target, k, ignore_index=-1):
+    # 'K' classes, output and target sizes are N or N * L or N * H * W, each value in range 0 to K - 1.
+    assert output.dim() in [1, 2, 3]
+    assert output.shape == target.shape
+    output = output.view(-1)
+    target = target.view(-1)
+    output[target == ignore_index] = ignore_index
+    intersection = output[output == target]
+    true_positive = torch.histc(intersection, bins=k, min=0, max=k - 1)
+    true_false_positive = torch.histc(output, bins=k, min=0, max=k - 1)
+    return true_positive, true_false_positive
+
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
 
@@ -52,48 +65,46 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
+
 class TorchIoU(Metric):
 
     def __init__(self):
         super().__init__()
-        self.add_state("intersection", default=torch.tensor(0.0, dtype=torch.float),
-                       dist_reduce_fx='sum')
-        self.add_state("union", default=torch.tensor(0.0, dtype=torch.float),
+        self.add_state("iou",
+                       default=torch.tensor(0.0, dtype=torch.float),
                        dist_reduce_fx='sum')
 
-    def update(self, intersection, union):
-        self.intersection += intersection
-        self.union += union
+    def update(self, iou):
+        self.iou += iou
 
     def compute(self):
-        return self.intersection / (self.union + 1e-10)
+        return self.iou
 
 
 class TorchAcc(Metric):
 
     def __init__(self):
         super().__init__()
-        self.add_state("intersection", default=torch.tensor(0.0, dtype=torch.float),
-                       dist_reduce_fx='sum')
-        self.add_state("target", default=torch.tensor(0.0, dtype=torch.float),
+        self.add_state("acc",
+                       default=torch.tensor(0.0, dtype=torch.float),
                        dist_reduce_fx='sum')
 
-    def update(self, intersection, target):
-        self.intersection += intersection
-        self.target += target
+    def update(self, acc):
+        self.acc += acc
 
     def compute(self):
-        return self.intersection / (self.target + 1e-10)
+        return self.acc
 
 
 class TorchRuntime(Metric):
 
     def __init__(self):
         super().__init__()
-        self.add_state("sum_runtime", default=torch.tensor(0.0, dtype=torch.float),
+        self.add_state("sum_runtime",
+                       default=torch.tensor(0.0, dtype=torch.float),
                        dist_reduce_fx='sum')
 
-    def update(self, runtime, n_runs):
+    def update(self, runtime):
         self.sum_runtime += runtime
 
     def compute(self):

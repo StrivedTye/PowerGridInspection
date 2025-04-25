@@ -21,7 +21,6 @@ def create_datasets(cfg, split_types, log):
             if is_dataset:
                 type2dataset[clsmember[0]] = clsmember[1]
 
-
     datasets = []
     s_types = [split_types] if type(split_types) == str else split_types
 

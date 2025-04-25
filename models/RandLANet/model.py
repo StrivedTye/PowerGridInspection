@@ -1,194 +1,306 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import pytorch_utils as pt_utils
-
+import pytorch3d.ops
 from models.base_model import BaseModel
-from ..utils import pytorch_utils as pt_utils
 
 
 class RandLANet(BaseModel):
     def __init__(self, config, log):
         super().__init__(config, log)
-        self.config = config
+        self.num_neighbors = config.num_neighbors
+        self.decimation = config.decimation
 
-        self.fc0 = pt_utils.Conv1d(3, 8, kernel_size=1, bn=True)
+        self.fc_start = nn.Linear(3, 8)
+        self.bn_start = nn.Sequential(
+            nn.BatchNorm2d(8, eps=1e-6, momentum=0.99),
+            nn.LeakyReLU(0.2)
+        )
 
-        self.dilated_res_blocks = nn.ModuleList()
-        d_in = 8
-        for i in range(self.config.num_layers):
-            d_out = self.config.d_out[i]
-            self.dilated_res_blocks.append(Dilated_res_block(d_in, d_out))
-            d_in = 2 * d_out
+        # encoding layers
+        self.encoder = nn.ModuleList([
+            LocalFeatureAggregation(8, 16, self.num_neighbors),
+            LocalFeatureAggregation(32, 64, self.num_neighbors),
+            LocalFeatureAggregation(128, 128, self.num_neighbors),
+            LocalFeatureAggregation(256, 256, self.num_neighbors)
+        ])
 
-        d_out = d_in
-        self.decoder_0 = pt_utils.Conv2d(d_in, d_out, kernel_size=(1, 1), bn=True)
+        self.mlp = SharedMLP(512, 512, activation_fn=nn.ReLU())
 
-        self.decoder_blocks = nn.ModuleList()
-        for j in range(self.config.num_layers):
-            if j < 3:
-                d_in = d_out + 2 * self.config.d_out[-j - 2]
-                d_out = 2 * self.config.d_out[-j - 2]
-            else:
-                d_in = 4 * self.config.d_out[-4]
-                d_out = 2 * self.config.d_out[-4]
-            self.decoder_blocks.append(pt_utils.Conv2d(d_in, d_out, kernel_size=(1, 1), bn=True))
+        # decoding layers
+        decoder_kwargs = dict(
+            transpose=True,
+            bn=True,
+            activation_fn=nn.ReLU()
+        )
+        self.decoder = nn.ModuleList([
+            SharedMLP(1024, 256, **decoder_kwargs),
+            SharedMLP(512, 128, **decoder_kwargs),
+            SharedMLP(256, 32, **decoder_kwargs),
+            SharedMLP(64, 8, **decoder_kwargs)
+        ])
 
-        self.fc1 = pt_utils.Conv2d(d_out, 64, kernel_size=(1, 1), bn=True)
-        self.fc2 = pt_utils.Conv2d(64, 32, kernel_size=(1, 1), bn=True)
-        self.dropout = nn.Dropout(0.5)
-        self.fc3 = pt_utils.Conv2d(32, self.config.num_classes, kernel_size=(1, 1), bn=False, activation=None)
+        # final semantic prediction
+        self.fc_end = nn.Sequential(
+            SharedMLP(8, 64, bn=True, activation_fn=nn.ReLU()),
+            SharedMLP(64, 32, bn=True, activation_fn=nn.ReLU()),
+            nn.Dropout(),
+            SharedMLP(32, config.num_classes)
+        )
 
-    def forward(self, end_points):
+    def forward(self, batch):
+        r"""
+            Forward pass
 
-        features = end_points['features']  # Batch*channel*npoints
-        features = self.fc0(features)
+            Parameters
+            ----------
+            input: torch.Tensor, shape (B, N, d_in)
+                input points
 
-        features = features.unsqueeze(dim=3)  # Batch*channel*npoints*1
+            Returns
+            -------
+            torch.Tensor, shape (B, num_classes, N)
+                segmentation scores for each point
+        """
+        input = batch['pcds'].transpose(1, 2)
+        N = input.size(1)
+        d = self.decimation
 
-        # ###########################Encoder############################
-        f_encoder_list = []
-        for i in range(self.config.num_layers):
-            f_encoder_i = self.dilated_res_blocks[i](features, end_points['xyz'][i], end_points['neigh_idx'][i])
+        coords = input[..., :3].clone()
+        x = self.fc_start(input).transpose(-2, -1).unsqueeze(-1)
+        x = self.bn_start(x)  # shape (B, d, N, 1)
 
-            f_sampled_i = self.random_sample(f_encoder_i, end_points['sub_idx'][i])
-            features = f_sampled_i
-            if i == 0:
-                f_encoder_list.append(f_encoder_i)
-            f_encoder_list.append(f_sampled_i)
-        # ###########################Encoder############################
+        decimation_ratio = 1
 
-        features = self.decoder_0(f_encoder_list[-1])
+        # <<<<<<<<<< ENCODER
+        x_stack = []
 
-        # ###########################Decoder############################
-        f_decoder_list = []
-        for j in range(self.config.num_layers):
-            f_interp_i = self.nearest_interpolation(features, end_points['interp_idx'][-j - 1])
-            f_decoder_i = self.decoder_blocks[j](torch.cat([f_encoder_list[-j - 2], f_interp_i], dim=1))
+        permutation = torch.randperm(N)
+        coords = coords[:, permutation]
+        x = x[:, :, permutation]
 
-            features = f_decoder_i
-            f_decoder_list.append(f_decoder_i)
-        # ###########################Decoder############################
+        for lfa in self.encoder:
+            # at iteration i, x.shape = (B, N//(d**i), d_in)
+            x = lfa(coords[:, :N // decimation_ratio], x)
+            x_stack.append(x.clone())
+            decimation_ratio *= d
+            x = x[:, :, :N // decimation_ratio]
+        # # >>>>>>>>>> ENCODER
 
-        features = self.fc1(features)
-        features = self.fc2(features)
-        features = self.dropout(features)
-        features = self.fc3(features)
-        f_out = features.squeeze(3)
+        x = self.mlp(x)
 
-        end_points['logits'] = f_out
+        # <<<<<<<<<< DECODER
+        for mlp in self.decoder:
+            _, neighbors, _ = pytorch3d.ops.knn_points(
+                coords[:, :d * N // decimation_ratio],  # upsampled set
+                coords[:, :N // decimation_ratio],  # original set
+                K=1, return_nn=True)  # shape (B, N, 1)
+
+            neighbors = neighbors.to(x).long()
+
+            extended_neighbors = neighbors.unsqueeze(1).expand(-1, x.size(1), -1, 1)
+
+            x_neighbors = torch.gather(x, -2, extended_neighbors)
+
+            x = torch.cat((x_neighbors, x_stack.pop()), dim=1)
+
+            x = mlp(x)
+
+            decimation_ratio //= d
+        # >>>>>>>>>> DECODER
+
+        # inverse permutation
+        x = x[:, :, torch.argsort(permutation)]
+
+        x = self.fc_end(x)
+
+        end_points = dict(labels=batch['labels'],  # B, N
+                          logits=x.squeeze(-1),  # B, c, N
+                          )
+
         return end_points
 
-    @staticmethod
-    def random_sample(feature, pool_idx):
+
+class SharedMLP(nn.Module):
+    def __init__(
+            self,
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            transpose=False,
+            padding_mode='zeros',
+            bn=False,
+            activation_fn=None
+    ):
+        super(SharedMLP, self).__init__()
+
+        conv_fn = nn.ConvTranspose2d if transpose else nn.Conv2d
+
+        self.conv = conv_fn(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding_mode=padding_mode
+        )
+        self.batch_norm = nn.BatchNorm2d(out_channels, eps=1e-6, momentum=0.99) if bn else None
+        self.activation_fn = activation_fn
+
+    def forward(self, input):
+        r"""
+            Forward pass of the network
+
+            Parameters
+            ----------
+            input: torch.Tensor, shape (B, d_in, N, K)
+
+            Returns
+            -------
+            torch.Tensor, shape (B, d_out, N, K)
         """
-        :param feature: [B, N, d] input features matrix
-        :param pool_idx: [B, N', max_num] N' < N, N' is the selected position after pooling
-        :return: pool_features = [B, N', d] pooled features matrix
+        x = self.conv(input)
+        if self.batch_norm:
+            x = self.batch_norm(x)
+        if self.activation_fn:
+            x = self.activation_fn(x)
+        return x
+
+
+class LocalSpatialEncoding(nn.Module):
+    def __init__(self, d, num_neighbors):
+        super(LocalSpatialEncoding, self).__init__()
+
+        self.num_neighbors = num_neighbors
+        self.mlp = SharedMLP(10, d, bn=True, activation_fn=nn.ReLU())
+
+    def forward(self, coords, features, knn_output):
+        r"""
+            Forward pass
+
+            Parameters
+            ----------
+            coords: torch.Tensor, shape (B, N, 3)
+                coordinates of the point cloud
+            features: torch.Tensor, shape (B, d, N, 1)
+                features of the point cloud
+            neighbors: tuple
+
+            Returns
+            -------
+            torch.Tensor, shape (B, 2*d, N, K)
         """
-        feature = feature.squeeze(dim=3)  # batch*channel*npoints
-        num_neigh = pool_idx.shape[-1]
-        d = feature.shape[1]
-        batch_size = pool_idx.shape[0]
-        pool_idx = pool_idx.reshape(batch_size, -1)  # batch*(npoints,nsamples)
-        pool_features = torch.gather(feature, 2, pool_idx.unsqueeze(1).repeat(1, feature.shape[1], 1))
-        pool_features = pool_features.reshape(batch_size, d, -1, num_neigh)
-        pool_features = pool_features.max(dim=3, keepdim=True)[0]  # batch*channel*npoints*1
-        return pool_features
+        # finding neighboring points
+        idx, dist = knn_output
+        B, N, K = idx.size()
+        # idx(B, N, K), coords(B, N, 3)
+        # neighbors[b, i, n, k] = coords[b, idx[b, n, k], i] = extended_coords[b, i, extended_idx[b, i, n, k], k]
+        extended_idx = idx.unsqueeze(1).expand(B, 3, N, K)
+        extended_coords = coords.transpose(-2, -1).unsqueeze(-1).expand(B, 3, N, K)
+        neighbors = torch.gather(extended_coords, 2, extended_idx)  # shape (B, 3, N, K)
+        # if USE_CUDA:
+        #     neighbors = neighbors.cuda()
 
-    @staticmethod
-    def nearest_interpolation(feature, interp_idx):
+        # relative point position encoding
+        concat = torch.cat((
+            extended_coords,
+            neighbors,
+            extended_coords - neighbors,
+            dist.unsqueeze(-3)
+        ), dim=-3).to(features)
+        return torch.cat((self.mlp(concat),features.expand(B, -1, N, K)), dim=-3)
+
+
+class AttentivePooling(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(AttentivePooling, self).__init__()
+
+        self.score_fn = nn.Sequential(
+            nn.Linear(in_channels, in_channels, bias=False),
+            nn.Softmax(dim=-2)
+        )
+        self.mlp = SharedMLP(in_channels, out_channels, bn=True, activation_fn=nn.ReLU())
+
+    def forward(self, x):
+        r"""
+            Forward pass
+
+            Parameters
+            ----------
+            x: torch.Tensor, shape (B, d_in, N, K)
+
+            Returns
+            -------
+            torch.Tensor, shape (B, d_out, N, 1)
         """
-        :param feature: [B, N, d] input features matrix
-        :param interp_idx: [B, up_num_points, 1] nearest neighbour index
-        :return: [B, up_num_points, d] interpolated features matrix
+        # computing attention scores
+        scores = self.score_fn(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        # sum over the neighbors
+        features = torch.sum(scores * x, dim=-1, keepdim=True)  # shape (B, d_in, N, 1)
+
+        return self.mlp(features)
+
+
+class LocalFeatureAggregation(nn.Module):
+    def __init__(self, d_in, d_out, num_neighbors):
+        super(LocalFeatureAggregation, self).__init__()
+
+        self.num_neighbors = num_neighbors
+
+        self.mlp1 = SharedMLP(d_in, d_out // 2, activation_fn=nn.LeakyReLU(0.2))
+        self.mlp2 = SharedMLP(d_out, 2 * d_out)
+        self.shortcut = SharedMLP(d_in, 2 * d_out, bn=True)
+
+        self.lse1 = LocalSpatialEncoding(d_out // 2, num_neighbors)
+        self.lse2 = LocalSpatialEncoding(d_out // 2, num_neighbors)
+
+        self.pool1 = AttentivePooling(d_out, d_out // 2)
+        self.pool2 = AttentivePooling(d_out, d_out)
+
+        self.lrelu = nn.LeakyReLU()
+
+    def forward(self, coords, features):
+        r"""
+            Forward pass
+
+            Parameters
+            ----------
+            coords: torch.Tensor, shape (B, N, 3)
+                coordinates of the point cloud
+            features: torch.Tensor, shape (B, d_in, N, 1)
+                features of the point cloud
+
+            Returns
+            -------
+            torch.Tensor, shape (B, 2*d_out, N, 1)
         """
-        feature = feature.squeeze(dim=3)  # batch*channel*npoints
-        batch_size = interp_idx.shape[0]
-        up_num_points = interp_idx.shape[1]
-        interp_idx = interp_idx.reshape(batch_size, up_num_points)
-        interpolated_features = torch.gather(feature, 2, interp_idx.unsqueeze(1).repeat(1, feature.shape[1], 1))
-        interpolated_features = interpolated_features.unsqueeze(3)  # batch*channel*npoints*1
-        return interpolated_features
+        distances, indices, _ = pytorch3d.ops.knn_points(coords, coords, K=self.num_neighbors, return_nn=True)
+        knn_output = (indices, distances)
+
+        x = self.mlp1(features)
+
+        x = self.lse1(coords, x, knn_output)
+        x = self.pool1(x)
+
+        x = self.lse2(coords, x, knn_output)
+        x = self.pool2(x)
+
+        return self.lrelu(self.mlp2(x) + self.shortcut(features))
 
 
-class Dilated_res_block(nn.Module):
-    def __init__(self, d_in, d_out):
-        super().__init__()
+if __name__ == '__main__':
+    import time
 
-        self.mlp1 = pt_utils.Conv2d(d_in, d_out // 2, kernel_size=(1, 1), bn=True)
-        self.lfa = Building_block(d_out)
-        self.mlp2 = pt_utils.Conv2d(d_out, d_out * 2, kernel_size=(1, 1), bn=True, activation=None)
-        self.shortcut = pt_utils.Conv2d(d_in, d_out * 2, kernel_size=(1, 1), bn=True, activation=None)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    def forward(self, feature, xyz, neigh_idx):
-        f_pc = self.mlp1(feature)  # Batch*channel*npoints*1
-        f_pc = self.lfa(xyz, f_pc, neigh_idx)  # Batch*d_out*npoints*1
-        f_pc = self.mlp2(f_pc)
-        shortcut = self.shortcut(feature)
-        return F.leaky_relu(f_pc + shortcut, negative_slope=0.2)
+    d_in = 7
+    cloud = 1000 * torch.randn(1, 2 ** 16, d_in).to(device)
+    model = RandLANet(d_in, 6, 16, 4, device)
+    # model.load_state_dict(torch.load('checkpoints/checkpoint_100.pth'))
+    model.eval()
 
-
-class Building_block(nn.Module):
-    def __init__(self, d_out):  # d_in = d_out//2
-        super().__init__()
-        self.mlp1 = pt_utils.Conv2d(10, d_out // 2, kernel_size=(1, 1), bn=True)
-        self.att_pooling_1 = Att_pooling(d_out, d_out // 2)
-
-        self.mlp2 = pt_utils.Conv2d(d_out // 2, d_out // 2, kernel_size=(1, 1), bn=True)
-        self.att_pooling_2 = Att_pooling(d_out, d_out)
-
-    def forward(self, xyz, feature, neigh_idx):  # feature: Batch*channel*npoints*1
-        f_xyz = self.relative_pos_encoding(xyz, neigh_idx)  # batch*npoint*nsamples*10
-        f_xyz = f_xyz.permute((0, 3, 1, 2))  # batch*10*npoint*nsamples
-        f_xyz = self.mlp1(f_xyz)
-        f_neighbours = self.gather_neighbour(feature.squeeze(-1).permute((0, 2, 1)),
-                                             neigh_idx)  # batch*npoint*nsamples*channel
-        f_neighbours = f_neighbours.permute((0, 3, 1, 2))  # batch*channel*npoint*nsamples
-        f_concat = torch.cat([f_neighbours, f_xyz], dim=1)
-        f_pc_agg = self.att_pooling_1(f_concat)  # Batch*channel*npoints*1
-
-        f_xyz = self.mlp2(f_xyz)
-        f_neighbours = self.gather_neighbour(f_pc_agg.squeeze(-1).permute((0, 2, 1)),
-                                             neigh_idx)  # batch*npoint*nsamples*channel
-        f_neighbours = f_neighbours.permute((0, 3, 1, 2))  # batch*channel*npoint*nsamples
-        f_concat = torch.cat([f_neighbours, f_xyz], dim=1)
-        f_pc_agg = self.att_pooling_2(f_concat)
-        return f_pc_agg
-
-    def relative_pos_encoding(self, xyz, neigh_idx):
-        neighbor_xyz = self.gather_neighbour(xyz, neigh_idx)  # batch*npoint*nsamples*3
-
-        xyz_tile = xyz.unsqueeze(2).repeat(1, 1, neigh_idx.shape[-1], 1)  # batch*npoint*nsamples*3
-        relative_xyz = xyz_tile - neighbor_xyz  # batch*npoint*nsamples*3
-        relative_dis = torch.sqrt(
-            torch.sum(torch.pow(relative_xyz, 2), dim=-1, keepdim=True))  # batch*npoint*nsamples*1
-        relative_feature = torch.cat([relative_dis, relative_xyz, xyz_tile, neighbor_xyz],
-                                     dim=-1)  # batch*npoint*nsamples*10
-        return relative_feature
-
-    @staticmethod
-    def gather_neighbour(pc, neighbor_idx):  # pc: batch*npoint*channel
-        # gather the coordinates or features of neighboring points
-        batch_size = pc.shape[0]
-        num_points = pc.shape[1]
-        d = pc.shape[2]
-        index_input = neighbor_idx.reshape(batch_size, -1)
-        features = torch.gather(pc, 1, index_input.unsqueeze(-1).repeat(1, 1, pc.shape[2]))
-        features = features.reshape(batch_size, num_points, neighbor_idx.shape[-1], d)  # batch*npoint*nsamples*channel
-        return features
-
-
-class Att_pooling(nn.Module):
-    def __init__(self, d_in, d_out):
-        super().__init__()
-        self.fc = nn.Conv2d(d_in, d_in, (1, 1), bias=False)
-        self.mlp = pt_utils.Conv2d(d_in, d_out, kernel_size=(1, 1), bn=True)
-
-    def forward(self, feature_set):
-        att_activation = self.fc(feature_set)
-        att_scores = F.softmax(att_activation, dim=3)
-        f_agg = feature_set * att_scores
-        f_agg = torch.sum(f_agg, dim=3, keepdim=True)
-        f_agg = self.mlp(f_agg)
-        return f_agg
+    t0 = time.time()
+    pred = model(cloud)
+    t1 = time.time()
+    # print(pred)
+    print(t1 - t0)
