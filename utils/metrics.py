@@ -31,10 +31,11 @@ def intersection_and_union_gpu(output, target, k, ignore_index=-1):
     area_output = torch.histc(output, bins=k, min=0, max=k - 1)
     area_target = torch.histc(target, bins=k, min=0, max=k - 1)
     area_union = area_output + area_target - area_intersection
-    return area_intersection, area_union, area_target
+    iou = torch.mean(area_intersection / (area_union + 1e-10))
+    return area_intersection, area_union, iou
 
 
-def accuracy(output, target, k, ignore_index=-1):
+def accuracy_gpu(output, target, k, ignore_index=-1):
     # 'K' classes, output and target sizes are N or N * L or N * H * W, each value in range 0 to K - 1.
     assert output.dim() in [1, 2, 3]
     assert output.shape == target.shape
@@ -44,7 +45,8 @@ def accuracy(output, target, k, ignore_index=-1):
     intersection = output[output == target]
     true_positive = torch.histc(intersection, bins=k, min=0, max=k - 1)
     true_false_positive = torch.histc(output, bins=k, min=0, max=k - 1)
-    return true_positive, true_false_positive
+    acc = torch.mean(true_positive / (true_false_positive + 1e-10))
+    return true_positive, true_false_positive, acc
 
 
 class AverageMeter(object):
@@ -70,30 +72,25 @@ class TorchIoU(Metric):
 
     def __init__(self):
         super().__init__()
-        self.add_state("iou",
-                       default=torch.tensor(0.0, dtype=torch.float),
-                       dist_reduce_fx='sum')
-
+        self.add_state("iou", default=[])
     def update(self, iou):
-        self.iou += iou
+        self.iou.append(iou)
 
     def compute(self):
-        return self.iou
+        return torch.mean(torch.tensor(self.iou))
 
 
 class TorchAcc(Metric):
 
     def __init__(self):
         super().__init__()
-        self.add_state("acc",
-                       default=torch.tensor(0.0, dtype=torch.float),
-                       dist_reduce_fx='sum')
+        self.add_state("acc", default=[])
 
     def update(self, acc):
-        self.acc += acc
+        self.acc.append(acc)
 
     def compute(self):
-        return self.acc
+        return torch.mean(torch.tensor(self.acc))
 
 
 class TorchRuntime(Metric):

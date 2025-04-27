@@ -59,16 +59,13 @@ class BaseTask(pl.LightningModule):
 
         pred_labels = torch.argmax(end_points['logits'], dim=1)  # b, n
         gt_labels = end_points['labels']
-        intersection, union, target = intersection_and_union_gpu(pred_labels,
+        intersection, union, iou = intersection_and_union_gpu(pred_labels,
                                                                  gt_labels,
                                                                  self.cfg.model_cfg.num_classes,
                                                                  ignore_index=0)
-        iou = torch.mean(intersection / (union + 1e-10))
-
-        tp, tfp = accuracy(pred_labels,
+        tp, tfp, acc = accuracy_gpu(pred_labels,
                            gt_labels,
                            self.cfg.model_cfg.num_classes, ignore_index=0)
-        acc = torch.mean(tp / (tfp + 1e-10))
 
         self.iou(iou)
         self.acc(acc)
@@ -95,16 +92,13 @@ class BaseTask(pl.LightningModule):
 
         pred_labels = torch.argmax(end_points['logits'], dim=1)  # b, n
         gt_labels = end_points['labels']
-        intersection, union, target = intersection_and_union_gpu(pred_labels,
+        intersection, union, iou = intersection_and_union_gpu(pred_labels,
                                                                  gt_labels,
                                                                  self.cfg.model_cfg.num_classes,
                                                                  ignore_index=0)
-        iou = torch.mean(intersection / (union + 1e-10))
-
-        tp, tfp = accuracy(pred_labels,
+        tp, tfp, acc = accuracy_gpu(pred_labels,
                            gt_labels,
                            self.cfg.model_cfg.num_classes, ignore_index=0)
-        acc = torch.mean(tp / (tfp + 1e-10))
 
         self.iou(iou)
         self.acc(acc)
