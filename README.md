@@ -49,7 +49,9 @@ python main.py configs/seg_RandLANet_poweruav_cfg.yaml --gpus 0 1
 To test a trained model, specify the checkpoint location with `--resume_from` argument and set the `--phase` argument as `test`.
 
 ```
-python main.py configs/mbptrack_kitti_ped_cfg.yaml --phase test --resume_from pretrained/mbptrack_kitti_ped.ckpt
+python main.py configs/seg_RandLANet_poweruav_cfg.yaml \ 
+               --phase test \ 
+               --resume_from ./workspace/seg_RandLANet_poweruav_cfg/2025-04-25_15-14-53/checkpoints/***.ckpt
 ```
 
 

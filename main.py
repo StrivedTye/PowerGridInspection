@@ -37,11 +37,8 @@ def parse_args():
 
 def add_args_to_cfg(args, cfg):
     run_name = osp.splitext(osp.basename(args.config))[0] if args.run_name is None else args.run_name
-    cfg.work_dir = osp.abspath(osp.join(args.workspace,
-                                        run_name,
-                                        datetime.now().strftime(r'%Y-%m-%d_%H-%M-%S')
-                                        )
-                               )
+    cfg.work_dir = osp.abspath(osp.join(args.workspace, run_name, datetime.now().strftime(r'%Y-%m-%d_%H-%M-%S')))
+
     if args.gpus is None:
         pynvml.nvmlInit()
         gpu_ids = list(range(torch.cuda.device_count()))
@@ -62,7 +59,7 @@ def add_args_to_cfg(args, cfg):
         cfg.seed = 1234
         cfg.train_cfg.val_per_epoch = 1
         cfg.train_cfg.max_epochs = 10
-        cfg.train_cfg.batch_size = 2*len(cfg.gpus)
+        cfg.train_cfg.batch_size = 2 * len(cfg.gpus)
     else:
         cfg.seed = args.seed
 
@@ -100,7 +97,6 @@ class CustomTensorBoardLogger(TensorBoardLogger):
 
 
 def main():
-
     args = parse_args()
     with open(args.config, 'r') as f:
         cfg = yaml.load(f, Loader=yaml.FullLoader)
@@ -125,6 +121,7 @@ def main():
             split_types=['train', 'test'],  # ['train', 'val']
             log=log
         )
+
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=cfg.train_cfg.batch_size,
@@ -133,6 +130,7 @@ def main():
             shuffle=True,
             drop_last=True
         )
+
         val_dataloader = DataLoader(
             val_dataset,
             shuffle=False,
@@ -141,12 +139,14 @@ def main():
             num_workers=cfg.eval_cfg.num_workers,
             collate_fn=lambda x: x
         )
+
         regular_ckpt_callback = ModelCheckpoint(
             filename='{epoch}',
             save_top_k=-1,
             save_last=True,
             every_n_epochs=cfg.train_cfg.save_per_epoch
         )
+
         best_ckpt_callback = ModelCheckpoint(
             filename='best_{epoch}_{iou}_{acc}',
             monitor='iou',
@@ -167,7 +167,9 @@ def main():
             gpus=cfg.gpus,
             strategy=strategy,
             max_epochs=cfg.train_cfg.max_epochs,
-            callbacks=[regular_ckpt_callback, best_ckpt_callback, progress_bar_callback] if not cfg.debug else [progress_bar_callback],
+            callbacks=[regular_ckpt_callback,
+                       best_ckpt_callback,
+                       progress_bar_callback] if not cfg.debug else [progress_bar_callback],
             default_root_dir=cfg.work_dir,
             check_val_every_n_epoch=cfg.train_cfg.val_per_epoch,
             enable_model_summary=False,
@@ -177,6 +179,7 @@ def main():
             logger=logger,
             gradient_clip_val=0.0
         )
+
         trainer.fit(task, train_dataloader, val_dataloader, ckpt_path=cfg.resume_from)
 
     elif cfg.phase == 'test':
@@ -186,6 +189,7 @@ def main():
             split_types='test',
             log=log
         )
+
         test_dataloader = DataLoader(
             test_dataset,
             shuffle=False,
@@ -194,6 +198,7 @@ def main():
             num_workers=cfg.eval_cfg.num_workers,
             collate_fn=lambda x: x
         )
+
         progress_bar_callback = CustomProgressBar()
         logger = CustomTensorBoardLogger(save_dir=cfg.work_dir, version='', name='')
 
@@ -205,12 +210,12 @@ def main():
             default_root_dir=cfg.work_dir,
             enable_model_summary=False,
             num_sanity_val_steps=0,
-            logger=logger,
+            logger=logger
         )
+
         trainer.test(task, test_dataloader, ckpt_path=cfg.resume_from)
     else:
-        raise NotImplementedError(
-            '{} has not been implemented!'.format(cfg.phase))
+        raise NotImplementedError('{} has not been implemented!'.format(cfg.phase))
 
 
 if __name__ == '__main__':
